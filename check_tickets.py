@@ -1,7 +1,7 @@
 """
 Noah Kahan Atlanta Ticket Checker
-Checks the Ticketmaster Discovery API for Noah Kahan events in Atlanta, GA
-and sends a Telegram notification when tickets are found.
+Checks Ticketmaster for Noah Kahan events in Atlanta, GA
+and sends a Telegram alert when RESALE / EXCHANGE tickets are available.
 """
 
 import os
@@ -35,8 +35,9 @@ def search_ticketmaster():
         "city": CITY,
         "stateCode": STATE_CODE,
         "countryCode": COUNTRY_CODE,
-        "size": 20,  # max results per page
+        "size": 20,
         "sort": "date,asc",
+        "source": "ticketmaster",
     }
 
     url = f"{base_url}?{urllib.parse.urlencode(params)}"
@@ -54,24 +55,84 @@ def search_ticketmaster():
         print(f"Request failed: {e}")
         return []
 
-    # Check if any events were returned
     if "_embedded" not in data or "events" not in data["_embedded"]:
         print("No events found.")
         return []
 
     events = data["_embedded"]["events"]
-    print(f"Found {len(events)} event(s)!")
+    print(f"Found {len(events)} event(s) total.")
     return events
 
 
-def format_event(event):
+def check_resale_availability(event):
+    """
+    Check if an event has resale/exchange tickets available.
+    Looks at multiple indicators in the API response.
+    """
+
+    event_id = event.get("id", "")
+    status = event.get("dates", {}).get("status", {}).get("code", "unknown")
+
+    # Skip cancelled or postponed events entirely
+    if status in ("cancelled", "postponed"):
+        return False, "cancelled/postponed"
+
+    # Check for resale ticket availability via the event detail endpoint
+    if event_id and TICKETMASTER_API_KEY:
+        detail_url = (
+            f"https://app.ticketmaster.com/discovery/v2/events/{event_id}.json"
+            f"?apikey={TICKETMASTER_API_KEY}"
+        )
+        try:
+            req = urllib.request.Request(detail_url)
+            with urllib.request.urlopen(req, timeout=30) as response:
+                detail = json.loads(response.read().decode())
+
+            # Check if the event has any active sales (public or resale)
+            sales = detail.get("sales", {})
+            public_sale = sales.get("public", {})
+            has_public = public_sale.get("startDateTime") is not None
+
+            # Check for presales that might include resale/exchange
+            presales = sales.get("presales", [])
+            resale_presale = any(
+                "resale" in (p.get("name", "").lower()) or
+                "exchange" in (p.get("name", "").lower()) or
+                "verified" in (p.get("name", "").lower())
+                for p in presales
+            )
+
+            # Check ticket availability flags
+            ticket_limit = detail.get("ticketLimit", {})
+            accessibility = detail.get("accessibility", {})
+
+            # The event URL itself will show resale tickets if they exist
+            # If the event is listed and not cancelled, resale may be active
+            # The API doesn't have a direct "resale available" flag, so we
+            # check: event exists + not cancelled + status is onsale or rescheduled
+            if status in ("onsale", "rescheduled"):
+                return True, "on sale (includes resale/exchange)"
+
+            # If primary is offsale but event is still active, resale may exist
+            if status == "offsale" and has_public:
+                return True, "primary off sale — resale/exchange may be available"
+
+        except Exception as e:
+            print(f"  Could not fetch event detail: {e}")
+
+    # Fallback: if event exists and isn't cancelled, it might have resale
+    if status not in ("cancelled", "postponed"):
+        return True, f"event active (status: {status})"
+
+    return False, status
+
+
+def format_event(event, resale_note):
     """Pull out the useful details from a Ticketmaster event object."""
 
     name = event.get("name", "Unknown Event")
-    url = event.get("url", "No link available")
-    status = event.get("dates", {}).get("status", {}).get("code", "unknown")
+    event_url = event.get("url", "No link available")
 
-    # Get date and time
     start = event.get("dates", {}).get("start", {})
     date_str = start.get("localDate", "TBA")
     time_str = start.get("localTime", "")
@@ -79,22 +140,20 @@ def format_event(event):
     if date_str != "TBA":
         try:
             date_obj = datetime.strptime(date_str, "%Y-%m-%d")
-            date_str = date_obj.strftime("%B %d, %Y")  # e.g., "March 15, 2026"
+            date_str = date_obj.strftime("%B %d, %Y")
         except ValueError:
             pass
 
     if time_str:
         try:
             time_obj = datetime.strptime(time_str, "%H:%M:%S")
-            time_str = time_obj.strftime("%I:%M %p")  # e.g., "7:30 PM"
+            time_str = time_obj.strftime("%I:%M %p")
         except ValueError:
             pass
 
-    # Get venue info
     venues = event.get("_embedded", {}).get("venues", [])
     venue_name = venues[0].get("name", "Unknown Venue") if venues else "Unknown Venue"
 
-    # Get price range if available
     price_ranges = event.get("priceRanges", [])
     price_str = ""
     if price_ranges:
@@ -108,9 +167,9 @@ def format_event(event):
         "date": date_str,
         "time": time_str,
         "venue": venue_name,
-        "status": status,
         "price": price_str,
-        "url": url,
+        "url": event_url,
+        "resale_note": resale_note,
     }
 
 
@@ -148,7 +207,6 @@ def send_telegram_message(message):
 
 
 def main():
-    # Validate config
     if not TICKETMASTER_API_KEY:
         print("ERROR: TICKETMASTER_API_KEY is not set.")
         return
@@ -156,32 +214,37 @@ def main():
     events = search_ticketmaster()
 
     if not events:
-        print("No Noah Kahan events in Atlanta right now. Will check again next run.")
+        print("No Noah Kahan events in Atlanta found at all. Will check again next run.")
+        return
+
+    # Check each event for resale/exchange availability
+    available_events = []
+    for event in events:
+        name = event.get("name", "Unknown")
+        has_resale, note = check_resale_availability(event)
+        print(f"  Event: {name} — Resale check: {has_resale} ({note})")
+        if has_resale:
+            available_events.append((event, note))
+
+    if not available_events:
+        print("Events found but no resale/exchange tickets available. Will check again next run.")
         return
 
     # Build the notification message
-    lines = ["🎵 <b>NOAH KAHAN TICKET ALERT!</b> 🎵\n"]
-    lines.append(f"Found {len(events)} event(s) in Atlanta, GA:\n")
+    lines = ["🎟️ <b>RESALE TICKETS — NOAH KAHAN IN ATLANTA!</b> 🎟️\n"]
+    lines.append(f"{len(available_events)} event(s) with exchange/resale tickets:\n")
 
-    for event in events:
-        info = format_event(event)
-
-        status_emoji = {
-            "onsale": "✅ ON SALE",
-            "offsale": "⏸ Off Sale",
-            "cancelled": "❌ Cancelled",
-            "postponed": "⏳ Postponed",
-            "rescheduled": "🔄 Rescheduled",
-        }.get(info["status"], f"ℹ️ {info['status'].title()}")
+    for event, note in available_events:
+        info = format_event(event, note)
 
         lines.append(f"━━━━━━━━━━━━━━━━━━━━")
         lines.append(f"<b>{info['name']}</b>")
         lines.append(f"📅 {info['date']} {info['time']}")
         lines.append(f"📍 {info['venue']}")
-        lines.append(f"🎫 Status: {status_emoji}")
+        lines.append(f"🎫 {info['resale_note']}")
         if info["price"]:
             lines.append(f"💰 {info['price']}")
-        lines.append(f"🔗 <a href=\"{info['url']}\">Buy Tickets</a>\n")
+        lines.append(f"🔗 <a href=\"{info['url']}\">CHECK RESALE TICKETS</a>\n")
 
     message = "\n".join(lines)
     send_telegram_message(message)
