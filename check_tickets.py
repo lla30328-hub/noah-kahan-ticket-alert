@@ -1,7 +1,12 @@
 """
 Noah Kahan Atlanta Ticket Checker
 Checks Ticketmaster for Noah Kahan events in Atlanta, GA
-and sends a Telegram alert when RESALE / EXCHANGE tickets are available.
+and sends a Telegram alert ONLY when something NEW changes:
+- A new event appears
+- Ticket status changes (e.g. goes on sale)
+- Price range changes
+
+Uses a GitHub Gist as free cloud storage to remember what it already told you.
 """
 
 import os
@@ -16,6 +21,8 @@ from datetime import datetime
 TICKETMASTER_API_KEY = os.environ.get("TICKETMASTER_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+GIST_ID = os.environ.get("GIST_ID", "")
+GITHUB_TOKEN = os.environ.get("GH_TOKEN", "")
 
 # --- Search Settings ---
 ARTIST_NAME = "Noah Kahan"
@@ -23,6 +30,68 @@ CITY = "Atlanta"
 STATE_CODE = "GA"
 COUNTRY_CODE = "US"
 
+# Filename used inside the Gist to store state
+STATE_FILENAME = "ticket_state.json"
+
+
+# ── State Management (GitHub Gist) ───────────────────────────────
+
+def load_previous_state():
+    """Load the last known state from a GitHub Gist."""
+    if not GIST_ID or not GITHUB_TOKEN:
+        print("No Gist configured — treating everything as new.")
+        return {}
+
+    url = f"https://api.github.com/gists/{GIST_ID}"
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    })
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            gist = json.loads(resp.read().decode())
+        content = gist.get("files", {}).get(STATE_FILENAME, {}).get("content", "{}")
+        state = json.loads(content)
+        print(f"Loaded previous state: {len(state)} event(s) tracked.")
+        return state
+    except Exception as e:
+        print(f"Could not load previous state: {e}")
+        return {}
+
+
+def save_current_state(state):
+    """Save the current state to a GitHub Gist."""
+    if not GIST_ID or not GITHUB_TOKEN:
+        print("No Gist configured — state not saved.")
+        return
+
+    url = f"https://api.github.com/gists/{GIST_ID}"
+    payload = json.dumps({
+        "files": {
+            STATE_FILENAME: {
+                "content": json.dumps(state, indent=2)
+            }
+        }
+    }).encode("utf-8")
+
+    req = urllib.request.Request(url, data=payload, method="PATCH", headers={
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+        "Content-Type": "application/json",
+    })
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            if resp.status == 200:
+                print("State saved to Gist.")
+            else:
+                print(f"Gist save returned status {resp.status}")
+    except Exception as e:
+        print(f"Could not save state: {e}")
+
+
+# ── Ticketmaster API ─────────────────────────────────────────────
 
 def search_ticketmaster():
     """Search Ticketmaster Discovery API for Noah Kahan events in Atlanta."""
@@ -41,7 +110,6 @@ def search_ticketmaster():
     }
 
     url = f"{base_url}?{urllib.parse.urlencode(params)}"
-
     print(f"[{datetime.now()}] Checking Ticketmaster for {ARTIST_NAME} in {CITY}, {STATE_CODE}...")
 
     try:
@@ -64,92 +132,23 @@ def search_ticketmaster():
     return events
 
 
-def check_resale_availability(event):
+def get_event_snapshot(event):
     """
-    Check if an event has resale/exchange tickets available.
-    Looks at multiple indicators in the API response.
+    Create a comparable snapshot of an event's key details.
+    If any of these change, we send a new alert.
     """
 
-    event_id = event.get("id", "")
+    event_id = event.get("id", "unknown")
+    name = event.get("name", "Unknown Event")
     status = event.get("dates", {}).get("status", {}).get("code", "unknown")
 
-    # Skip cancelled or postponed events entirely
+    # Skip cancelled/postponed
     if status in ("cancelled", "postponed"):
-        return False, "cancelled/postponed"
-
-    # Check for resale ticket availability via the event detail endpoint
-    if event_id and TICKETMASTER_API_KEY:
-        detail_url = (
-            f"https://app.ticketmaster.com/discovery/v2/events/{event_id}.json"
-            f"?apikey={TICKETMASTER_API_KEY}"
-        )
-        try:
-            req = urllib.request.Request(detail_url)
-            with urllib.request.urlopen(req, timeout=30) as response:
-                detail = json.loads(response.read().decode())
-
-            # Check if the event has any active sales (public or resale)
-            sales = detail.get("sales", {})
-            public_sale = sales.get("public", {})
-            has_public = public_sale.get("startDateTime") is not None
-
-            # Check for presales that might include resale/exchange
-            presales = sales.get("presales", [])
-            resale_presale = any(
-                "resale" in (p.get("name", "").lower()) or
-                "exchange" in (p.get("name", "").lower()) or
-                "verified" in (p.get("name", "").lower())
-                for p in presales
-            )
-
-            # Check ticket availability flags
-            ticket_limit = detail.get("ticketLimit", {})
-            accessibility = detail.get("accessibility", {})
-
-            # The event URL itself will show resale tickets if they exist
-            # If the event is listed and not cancelled, resale may be active
-            # The API doesn't have a direct "resale available" flag, so we
-            # check: event exists + not cancelled + status is onsale or rescheduled
-            if status in ("onsale", "rescheduled"):
-                return True, "on sale (includes resale/exchange)"
-
-            # If primary is offsale but event is still active, resale may exist
-            if status == "offsale" and has_public:
-                return True, "primary off sale — resale/exchange may be available"
-
-        except Exception as e:
-            print(f"  Could not fetch event detail: {e}")
-
-    # Fallback: if event exists and isn't cancelled, it might have resale
-    if status not in ("cancelled", "postponed"):
-        return True, f"event active (status: {status})"
-
-    return False, status
-
-
-def format_event(event, resale_note):
-    """Pull out the useful details from a Ticketmaster event object."""
-
-    name = event.get("name", "Unknown Event")
-    event_url = event.get("url", "No link available")
+        return None
 
     start = event.get("dates", {}).get("start", {})
     date_str = start.get("localDate", "TBA")
     time_str = start.get("localTime", "")
-
-    if date_str != "TBA":
-        try:
-            date_obj = datetime.strptime(date_str, "%Y-%m-%d")
-            date_str = date_obj.strftime("%B %d, %Y")
-        except ValueError:
-            pass
-
-    if time_str:
-        try:
-            time_obj = datetime.strptime(time_str, "%H:%M:%S")
-            time_str = time_obj.strftime("%I:%M %p")
-        except ValueError:
-            pass
 
     venues = event.get("_embedded", {}).get("venues", [])
     venue_name = venues[0].get("name", "Unknown Venue") if venues else "Unknown Venue"
@@ -159,18 +158,74 @@ def format_event(event, resale_note):
     if price_ranges:
         low = price_ranges[0].get("min", "?")
         high = price_ranges[0].get("max", "?")
-        currency = price_ranges[0].get("currency", "USD")
-        price_str = f"${low} - ${high} {currency}"
+        price_str = f"${low}-${high}"
+
+    event_url = event.get("url", "")
 
     return {
+        "id": event_id,
         "name": name,
+        "status": status,
         "date": date_str,
         "time": time_str,
         "venue": venue_name,
         "price": price_str,
         "url": event_url,
-        "resale_note": resale_note,
     }
+
+
+def find_changes(previous_state, current_snapshots):
+    """
+    Compare current event snapshots to previous state.
+    Returns lists of new events, changed events, and the updated state dict.
+    """
+
+    new_events = []
+    changed_events = []
+    current_state = {}
+
+    for snap in current_snapshots:
+        eid = snap["id"]
+        current_state[eid] = snap
+
+        if eid not in previous_state:
+            # Brand new event we haven't seen before
+            new_events.append(("NEW", snap))
+        else:
+            # Event exists — check if anything important changed
+            old = previous_state[eid]
+            changes = []
+
+            if old.get("status") != snap["status"]:
+                changes.append(f"Status: {old.get('status')} → {snap['status']}")
+            if old.get("price") != snap["price"] and snap["price"]:
+                changes.append(f"Price: {old.get('price', 'N/A')} → {snap['price']}")
+            if old.get("date") != snap["date"]:
+                changes.append(f"Date: {old.get('date')} → {snap['date']}")
+
+            if changes:
+                changed_events.append((changes, snap))
+
+    return new_events, changed_events, current_state
+
+
+# ── Formatting & Notifications ───────────────────────────────────
+
+def format_date_nice(date_str, time_str):
+    """Format date and time for display."""
+    if date_str and date_str != "TBA":
+        try:
+            date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+            date_str = date_obj.strftime("%B %d, %Y")
+        except ValueError:
+            pass
+    if time_str:
+        try:
+            time_obj = datetime.strptime(time_str, "%H:%M:%S")
+            time_str = time_obj.strftime("%I:%M %p")
+        except ValueError:
+            pass
+    return f"{date_str} {time_str}".strip()
 
 
 def send_telegram_message(message):
@@ -193,8 +248,8 @@ def send_telegram_message(message):
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
 
     try:
-        with urllib.request.urlopen(req, timeout=15) as response:
-            result = json.loads(response.read().decode())
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read().decode())
             if result.get("ok"):
                 print("Telegram notification sent!")
                 return True
@@ -206,48 +261,79 @@ def send_telegram_message(message):
         return False
 
 
+# ── Main ─────────────────────────────────────────────────────────
+
 def main():
     if not TICKETMASTER_API_KEY:
         print("ERROR: TICKETMASTER_API_KEY is not set.")
         return
 
+    # 1. Load what we already know about
+    previous_state = load_previous_state()
+
+    # 2. Search Ticketmaster
     events = search_ticketmaster()
 
     if not events:
-        print("No Noah Kahan events in Atlanta found at all. Will check again next run.")
+        print("No Noah Kahan events in Atlanta right now. Will check again next run.")
         return
 
-    # Check each event for resale/exchange availability
-    available_events = []
+    # 3. Build snapshots of current events (skip cancelled/postponed)
+    current_snapshots = []
     for event in events:
-        name = event.get("name", "Unknown")
-        has_resale, note = check_resale_availability(event)
-        print(f"  Event: {name} — Resale check: {has_resale} ({note})")
-        if has_resale:
-            available_events.append((event, note))
+        snap = get_event_snapshot(event)
+        if snap:
+            current_snapshots.append(snap)
 
-    if not available_events:
-        print("Events found but no resale/exchange tickets available. Will check again next run.")
+    if not current_snapshots:
+        print("All found events are cancelled/postponed. Nothing to alert on.")
         return
 
-    # Build the notification message
-    lines = ["🎟️ <b>RESALE TICKETS — NOAH KAHAN IN ATLANTA!</b> 🎟️\n"]
-    lines.append(f"{len(available_events)} event(s) with exchange/resale tickets:\n")
+    # 4. Compare to previous state
+    new_events, changed_events, current_state = find_changes(previous_state, current_snapshots)
 
-    for event, note in available_events:
-        info = format_event(event, note)
+    # 5. Send alerts only if something is NEW or CHANGED
+    if not new_events and not changed_events:
+        print("No changes since last check. No alert needed.")
+        # Still save state in case structure changed
+        save_current_state(current_state)
+        return
 
-        lines.append(f"━━━━━━━━━━━━━━━━━━━━")
-        lines.append(f"<b>{info['name']}</b>")
-        lines.append(f"📅 {info['date']} {info['time']}")
-        lines.append(f"📍 {info['venue']}")
-        lines.append(f"🎫 {info['resale_note']}")
-        if info["price"]:
-            lines.append(f"💰 {info['price']}")
-        lines.append(f"🔗 <a href=\"{info['url']}\">CHECK RESALE TICKETS</a>\n")
+    lines = ["🎟️ <b>NOAH KAHAN — ATLANTA TICKET UPDATE!</b> 🎟️\n"]
+
+    if new_events:
+        lines.append(f"🆕 <b>{len(new_events)} NEW event(s) found:</b>\n")
+        for reason, snap in new_events:
+            date_nice = format_date_nice(snap["date"], snap["time"])
+            lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+            lines.append(f"<b>{snap['name']}</b>")
+            lines.append(f"📅 {date_nice}")
+            lines.append(f"📍 {snap['venue']}")
+            lines.append(f"🎫 Status: {snap['status']}")
+            if snap["price"]:
+                lines.append(f"💰 {snap['price']}")
+            lines.append(f"🔗 <a href=\"{snap['url']}\">CHECK TICKETS</a>\n")
+
+    if changed_events:
+        lines.append(f"🔄 <b>{len(changed_events)} event(s) UPDATED:</b>\n")
+        for changes, snap in changed_events:
+            date_nice = format_date_nice(snap["date"], snap["time"])
+            lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+            lines.append(f"<b>{snap['name']}</b>")
+            lines.append(f"📅 {date_nice}")
+            lines.append(f"📍 {snap['venue']}")
+            for change in changes:
+                lines.append(f"⚡ {change}")
+            if snap["price"]:
+                lines.append(f"💰 {snap['price']}")
+            lines.append(f"🔗 <a href=\"{snap['url']}\">CHECK TICKETS</a>\n")
 
     message = "\n".join(lines)
     send_telegram_message(message)
+
+    # 6. Save current state so next run knows what we already reported
+    save_current_state(current_state)
+    print("Done!")
 
 
 if __name__ == "__main__":
